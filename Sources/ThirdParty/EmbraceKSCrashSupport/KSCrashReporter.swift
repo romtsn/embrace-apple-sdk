@@ -6,6 +6,7 @@ import Foundation
 
 #if !EMBRACE_COCOAPOD_BUILDING_SDK
     import EmbraceCommonInternal
+    import EmbraceSemantics
 #endif
 
 #if canImport(KSCrashRecording)
@@ -14,8 +15,7 @@ import Foundation
     import KSCrash
 #endif
 
-@objc(KSCrashReporter)
-public final class KSCrashReporter: NSObject, CrashReporter {
+package final class KSCrashReporter: CrashReporter {
 
     // KSCrash uses C callbacks. We can't capture Swift in them.
     // The workaround is to hold onto a private shared instance.
@@ -54,9 +54,8 @@ public final class KSCrashReporter: NSObject, CrashReporter {
     private var watchdogData: EmbraceMutex<WatchdogEventData> = EmbraceMutex(WatchdogEventData())
     private var hangObservers: [NSObjectProtocol] = []
 
-    public override init() {
+    public init() {
         reporter.userInfo = [:]
-        super.init()
         KSCrashReporter.shared = self
     }
 
@@ -94,7 +93,12 @@ public final class KSCrashReporter: NSObject, CrashReporter {
                 $0.reportID = reportID
             }
         }
-        try reporter.install(with: config)
+        // `reporter.install` reaches `ksbic_init`, which rewrites KSCrash's unsynchronized
+        // `g_all_image_infos` global. Serialize against background log symbolication, which hits the
+        // same global concurrently during startup. See `KSCrashGlobalsLock`.
+        try KSCrashGlobalsLock.withLock {
+            try reporter.install(with: config)
+        }
         registerForHangs()
     }
 
@@ -151,12 +155,18 @@ public final class KSCrashReporter: NSObject, CrashReporter {
 
             // get custom data from report
             var sessionId: EmbraceIdentifier?
+            var processId: EmbraceIdentifier?
             var timestamp: Date?
             let signal: CrashSignal? = getCrashSignal(fromReport: report)
 
             if let userDict = report[KSCrashKey.user] as? [AnyHashable: Any] {
                 if let value = userDict[CrashReporterInfoKey.sessionId] as? String {
                     sessionId = EmbraceIdentifier(stringValue: value)
+                }
+
+                // Absent in reports written before the SDK started recording it.
+                if let value = userDict[CrashReporterInfoKey.processId] as? String {
+                    processId = EmbraceIdentifier(stringValue: value)
                 }
             }
 
@@ -169,9 +179,10 @@ public final class KSCrashReporter: NSObject, CrashReporter {
             // add report
             let crashReport = EmbraceCrashReport(
                 payload: payload,
-                provider: "kscrash",  // from LogSemantics+Crash.swift
+                provider: LogSemantics.Crash.ksCrashProvider,
                 internalId: EMBInt(id),
                 sessionId: sessionId?.stringValue,
+                processId: processId?.stringValue,
                 timestamp: timestamp,
                 signal: signal
             )

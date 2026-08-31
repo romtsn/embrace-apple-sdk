@@ -3,6 +3,7 @@
 //
 
 import EmbraceCommonInternal
+import EmbraceSemantics
 import TestSupport
 import XCTest
 
@@ -119,8 +120,8 @@ final class RemoteConfigTests: XCTestCase {
         config.payload.tapLimit = 654
 
         XCTAssertEqual(
-            config.spanEventsLimits,
-            SpanEventsLimits(breadcrumb: 987, tap: 654)
+            config.spanEventTypeLimits,
+            SpanEventTypeLimits(breadcrumb: 987, tap: 654)
         )
     }
 
@@ -133,8 +134,8 @@ final class RemoteConfigTests: XCTestCase {
         config.payload.logsErrorLimit = 30
 
         XCTAssertEqual(
-            config.logsLimits,
-            LogsLimits(info: 10, warning: 20, error: 30)
+            config.logSeverityLimits,
+            LogSeverityLimits(info: 10, warn: 20, error: 30)
         )
     }
 
@@ -152,6 +153,47 @@ final class RemoteConfigTests: XCTestCase {
             config.internalLogLimits,
             InternalLogLimits(trace: 10, debug: 20, info: 30, warning: 40, error: 50)
         )
+    }
+
+    func test_experimentsLimits() {
+        // given a config
+        let config = RemoteConfig(options: options, logger: logger)
+
+        config.payload.maxExperimentCount = 1000
+        config.payload.maxExperimentIdLength = 256
+        config.payload.maxExperimentVariantLength = 64
+
+        XCTAssertEqual(
+            config.experimentsLimits,
+            ExperimentsLimits(maxCount: 1000, maxIdLength: 256, maxVariantLength: 64)
+        )
+    }
+
+    func test_experimentsLimits_clampsOutOfRangePayloadValues() {
+        // given a config with payload values above the ceilings
+        let config = RemoteConfig(options: options, logger: logger)
+
+        config.payload.maxExperimentCount = 6000
+        config.payload.maxExperimentIdLength = 2048
+        config.payload.maxExperimentVariantLength = 2048
+
+        // then the limits are clamped
+        let limits = config.experimentsLimits
+        XCTAssertEqual(limits.maxCount, ExperimentsLimits.maxSettableCount)
+        XCTAssertEqual(limits.maxIdLength, ExperimentsLimits.maxSettableIdLength)
+        XCTAssertEqual(limits.maxVariantLength, ExperimentsLimits.maxSettableVariantLength)
+    }
+
+    func test_experimentsLimits_fallsBackToDefaultsForNegativePayloadValues() {
+        // given a config with malformed (negative) payload values
+        let config = RemoteConfig(options: options, logger: logger)
+
+        config.payload.maxExperimentCount = -1
+        config.payload.maxExperimentIdLength = -1
+        config.payload.maxExperimentVariantLength = -1
+
+        // then the built-in defaults are used
+        XCTAssertEqual(config.experimentsLimits, ExperimentsLimits())
     }
 
     func test_networkPayloadCaptureRules() {
@@ -262,11 +304,11 @@ final class RemoteConfigTests: XCTestCase {
         }
 
         // First fetch: payload changed from the default → the correction is logged once.
-        config.update { _, _ in }
+        config.update { _ in }
         XCTAssertEqual(hangWarnings(), 1, "a changed out-of-range payload should log its correction")
 
         // Second fetch: identical payload → didUpdate is false → must not re-log.
-        config.update { _, _ in }
+        config.update { _ in }
         XCTAssertEqual(hangWarnings(), 1, "an unchanged payload must not re-log (didUpdate gate)")
     }
 }
