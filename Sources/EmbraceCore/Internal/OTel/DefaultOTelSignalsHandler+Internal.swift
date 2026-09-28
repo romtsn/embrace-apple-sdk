@@ -132,7 +132,7 @@ extension DefaultOTelSignalsHandler: InternalOTelSignalsHandler {
         // get auto termination code from parent if needed
         var code = autoTerminationCode
         if let finalParent, code == nil {
-            code = cache.safeValue.autoTerminationSpans[finalParent.context.spanId]?.autoTerminationCode
+            code = cache.safeValue.autoTerminationCodes[finalParent.context.spanId]
         }
 
         // create span
@@ -154,9 +154,18 @@ extension DefaultOTelSignalsHandler: InternalOTelSignalsHandler {
         )
 
         // cache auto termination spans
-        if code != nil {
+        if let code {
             cache.withLock {
-                $0.autoTerminationSpans[context.spanId] = span
+                // Only spans that are still open can be terminated later. One created already ended
+                // never fires `onSpanEnded`, so it would never be evicted and would sit here for the
+                // rest of the session without anything to do.
+                if endTime == nil {
+                    $0.autoTerminationSpans[context.spanId] = span
+                }
+
+                // The code is kept either way, so a span created afterwards can name this one as
+                // its parent and inherit from it.
+                $0.autoTerminationCodes[context.spanId] = code
             }
         }
 
@@ -220,15 +229,23 @@ extension DefaultOTelSignalsHandler: InternalOTelSignalsHandler {
 
     // ends all the cached auto-termination spans
     func autoTerminateSpans() {
-        cache.withLock {
-            let now = Date()
-
-            for span in $0.autoTerminationSpans.values {
-                let code = span.autoTerminationCode ?? .unknown
-                span.end(errorCode: code, endTime: now)
-            }
-
+        // The spans are taken out of the cache before being ended, not while holding the lock:
+        // ending one calls back into `onSpanEnded`, which needs the same lock to drop the span
+        // it just ended.
+        let spans = cache.withLock {
+            let spans = Array($0.autoTerminationSpans.values)
             $0.autoTerminationSpans.removeAll()
+
+            // The codes go too: they exist to be inherited by spans created during the session
+            // that just ended, so nothing created afterwards should pick them up.
+            $0.autoTerminationCodes.removeAll()
+            return spans
+        }
+
+        let now = Date()
+        for span in spans {
+            let code = span.autoTerminationCode ?? .unknown
+            span.end(errorCode: code, endTime: now)
         }
 
         limiter.reset()
@@ -320,12 +337,19 @@ extension DefaultOTelSignalsHandler: EmbraceSpanDelegate {
         storage?.addSpanLink(id: span.context.spanId, traceId: span.context.traceId, link: link)
     }
 
-    func onSpanAttributesUpdated(_ span: EmbraceSpan, key: String, value: EmbraceAttributeValue?, attributes: EmbraceAttributes) {
+    func onSpanAttributeUpdated(_ span: EmbraceSpan, key: String, value: EmbraceAttributeValue?) {
         bridge.updateSpanAttribute(span, key: key, value: value)
-        storage?.setSpanAttributes(id: span.context.spanId, traceId: span.context.traceId, attributes: attributes)
+        storage?.setSpanAttribute(id: span.context.spanId, traceId: span.context.traceId, key: key, value: value)
     }
 
     func onSpanEnded(_ span: any EmbraceSpan, endTime: Date) {
+        // Auto-terminating spans are dropped from the cache when they end on their own, so the cache
+        // doesn't hold every one of them for the whole session. Their code is deliberately kept:
+        // a span created later can still name this one as its parent and inherit from it.
+        cache.withLock {
+            $0.autoTerminationSpans[span.context.spanId] = nil
+        }
+
         bridge.endSpan(span, endTime: endTime)
         storage?.endSpan(id: span.context.spanId, traceId: span.context.traceId, endTime: endTime)
     }
@@ -389,7 +413,7 @@ extension DefaultOTelSignalsHandler: EmbraceSpanDataSource {
 
         guard EmbraceSpanContext.isValidTraceId(traceId) else {
             throw EmbraceOTelError.invalidSpanLinkIdentifiers(
-                "Invalid trace id '\(traceId)' for a link on span \(spanName). Expected \(EmbraceSpanContext.traceIdLength) hexadecimal characters."
+                "Invalid trace id '\(traceId)' for a link on span \(spanName). Expected \(EmbraceSpanContext.traceIdLength) hexadecimal characters that are not all zeros."
             )
         }
 
@@ -406,9 +430,10 @@ extension DefaultOTelSignalsHandler: EmbraceSpanDataSource {
     }
 
     func validateAttribute(
-        for span: EmbraceSpan,
+        forSpanNamed spanName: String,
         key: String,
         value: EmbraceAttributeValue?,
+        currentAttributes: EmbraceAttributes,
         currentCount: Int
     ) throws -> (String, EmbraceAttributeValue?) {
 
@@ -419,8 +444,8 @@ extension DefaultOTelSignalsHandler: EmbraceSpanDataSource {
 
         // check limit
         let finalKey = sanitizer.sanitizeAttributeKey(key)
-        guard span.attributes[finalKey] != nil || limiter.shouldAddSpanAttribute(currentCount: currentCount) else {
-            throw EmbraceOTelError.spanAttributeLimitReached("Attributes limit reached for span \(span.name)")
+        guard currentAttributes[finalKey] != nil || limiter.shouldAddSpanAttribute(currentCount: currentCount) else {
+            throw EmbraceOTelError.spanAttributeLimitReached("Attributes limit reached for span \(spanName)")
         }
 
         let finalValue = sanitizer.sanitizeAttributeValue(value)
